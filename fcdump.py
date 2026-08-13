@@ -389,6 +389,10 @@ def main():
     ap = argparse.ArgumentParser(description="ファミコン汎用ダンプ機")
     ap.add_argument("--port", required=True)
     ap.add_argument("--baud", type=int, default=BAUD)
+    # ゼビウスのように、静的読みでは固定値しか返さず M2 のエッジを要求する基板がある。
+    # 症状は「どのアドレスを読んでも同じ値」。probe_prgaddr.py で判別できる。
+    ap.add_argument("--pulsed", action="store_true",
+                    help="M2をパルスさせて読む(静的読みでアドレスが効かない基板用)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("selftest")
@@ -416,6 +420,8 @@ def main():
     a = ap.parse_args()
     d = Dumper(a.port, a.baud)
     try:
+        if a.pulsed:
+            d.set_cycle(1)
         if a.cmd == "ping":
             print(d.ping())
         elif a.cmd == "selftest":
