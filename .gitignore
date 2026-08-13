@@ -1,0 +1,16 @@
+# 吸い出したROM（商用ゲームの複製なので公開しない）
+*.nes
+
+# 実行時の生成物
+__pycache__/
+*.pyc
+*.png
+dump_log*.txt
+consensus_log.txt
+dump_stdout.txt
+probe*.txt
+
+# ビルド成果物
+build/
+*.hex
+*.elf
