@@ -20,8 +20,16 @@
 //   PB0-PB5 = D8-D13  -> PRG A6-A11   (カート 7,6,5,4,3,2番)
 //   PC0-PC2 = A0-A2   -> PRG A12-A14  (カート 33,34,35番)
 //   PC4/PC5 = A4/A5   -> I2C SDA/SCL  (3kΩでVCCへプルアップ)
-//   PC3     = A3      -> 予備(入力のまま)
+//   PC3     = A3      -> CHR A12      (カート55番)
 //   PD0/PD1 = D0/D1   -> USB(PCへ)
+//
+//   ※ CHR A12 は本来 裸328P の PB0(14番)が担当していたが、
+//     故障(High/Lowを命令しても電圧が動かない)が確定したため、ここへ移設した。
+//     328P はカートを外して電源だけ入れた単体状態でも High/Low が振れず、
+//     配線の導通は生きていたので、328Pチップ内部(出力段)の故障と判断している。
+//     Uno はI2Cのマスターで、CHRアドレスが変わる瞬間を一番よく知っている当人なので、
+//     ここに移すとNano/328Pのファーム改修もI2Cの追加往復も要らない。
+//     328Pの14番ピン・そこへ向かう配線は今後使わない(繋いだままでも実害はない)。
 //
 //   ※ D13 は PRG A11 に取られているので基板上LEDは使えない。
 //      LEDが点かないのは異常ではない。
@@ -109,12 +117,18 @@ static void prgAddrOutput(bool on) {
   if (on) {
     DDRD |= 0xFC;            // PD0/PD1(USB)には触らない
     DDRB |= 0x3F;            // PB6/PB7は水晶
-    DDRC |= 0x07;            // PC3は予備、PC4/PC5はI2C
+    DDRC |= 0x0F;            // PC0-PC2=PRG A12-14、PC3=CHR A12。PC4/PC5はI2C
   } else {
     DDRD &= 0x03;
     DDRB &= (uint8_t)~0x3F;
-    DDRC &= (uint8_t)~0x07;
+    DDRC &= (uint8_t)~0x0F;
   }
+}
+
+// CHR A12 (カート55番)。328PのPB0が壊れたため、こちらで直接駆動する。
+// CHR ROMへの入力(コンソール→カート方向)なので、浮かせず常に確定させておく。
+static inline void setChrA12(uint8_t hi) {
+  if (hi) PORTC |= _BV(PC3); else PORTC &= (uint8_t)~_BV(PC3);
 }
 
 // ---------------------------------------------------------------- I2C
@@ -172,11 +186,13 @@ static bool setMode(uint8_t m) {
       // アドレスを与えても何も出てこない。
       ok &= i2cCmd2(CHR328_ADDR, C_SET_MODE, 1);
       ok &= i2cCmd3(CHR328_ADDR, C_SET_ADDR, 0x00, 0x00);
+      setChrA12(0);
       ok &= i2cCmd2(NANO_ADDR,   N_SET_MODE, MODE_PRG);
       break;
     case MODE_CHR:
       prgAddrOutput(true);
       setPrgAddr(0);
+      setChrA12(0);
       ok &= i2cCmd2(NANO_ADDR,   N_SET_MODE, MODE_CHR);
       ok &= i2cCmd2(CHR328_ADDR, C_SET_MODE, 1);
       break;
@@ -244,6 +260,7 @@ static void cmdChrRead(uint16_t addr, uint16_t n) {
   for (uint16_t i = 0; i < n; i++) {
     const uint16_t a = (uint16_t)(addr + i) & 0x1FFF;
     i2cCmd3(CHR328_ADDR, C_SET_ADDR, (uint8_t)(a & 0xFF), (uint8_t)(a >> 8));
+    setChrA12((uint8_t)((a >> 12) & 1));
     uint8_t lo, hi;
     if (!i2cGet(CHR328_ADDR, &lo)) lo = 0xFF;   // D0-D4 が bit0-4
     if (!i2cGet(NANO_ADDR, &hi))   hi = 0xFF;   // D5-D7 が bit5-7
@@ -319,6 +336,7 @@ static void handle(uint8_t cmd, const uint8_t *p, uint16_t len) {
 
     case CMD_CHR_ADDR:
       if (len != 2) { reply(ST_BAD_LEN); return; }
+      setChrA12((uint8_t)((p[1] >> 4) & 1));   // p[1]の bit4 = アドレスのbit12
       reply(i2cCmd3(CHR328_ADDR, C_SET_ADDR, p[0], p[1]) ? ST_OK : ST_NO_SLAVE);
       return;
 
