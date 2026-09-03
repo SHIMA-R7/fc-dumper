@@ -369,6 +369,88 @@ def dump_nrom(d, path, mirror="h", chr_size=8 * 1024):
     write_ines(path, prg, chr_data, mapper=0, mirror=mirror)
 
 
+# ---------------------------------------------------------------- MMC1 (Mapper 1)
+#
+# $8000-$FFFFのどこでもよい同じアドレスへ、bit7=1のリセット書き込み1回 →
+# 下位ビットから5回連続で1bitずつ書き込む、というシリアル方式。5回目の
+# 書き込みの「アドレス」のbit14-13で、コントロール/CHR0/CHR1/PRGのどの
+# 内部レジスタへ確定するかが決まる。ここでは常に同じアドレスへ5回とも
+# 書くやり方(定石通り)にしている。
+#
+# 実機は6502の連続する2サイクル以内の書き込みを無視する癖があるが、
+# I2C経由の書き込みはそれよりずっと遅いので気にしなくてよい。
+#
+# ドクターマリオで確認した実際の構成(Web調査): PRG 32KB(16KB×2バンク)、
+# CHR 32KB(8KB×4バンク)、水平ミラーリング。バンク総数が少ないので
+# 自動判定はせず、既知の値をそのまま使う。
+#
+# コントロールレジスタ: bit4=CHRモード(0=8KB) bit3-2=PRGモード
+# (2="$C000固定・$8000で切替") bit1-0=ミラーリング(2=水平 3=垂直)
+MMC1_REG_CTRL, MMC1_REG_CHR0, MMC1_REG_CHR1, MMC1_REG_PRG = 0x8000, 0xA000, 0xC000, 0xE000
+
+
+def mmc1_write(d, addr, value):
+    d.prg_write(addr, 0x80)          # シフトレジスタをリセット
+    time.sleep(0.002)
+    for i in range(5):
+        d.prg_write(addr, (value >> i) & 1)
+        time.sleep(0.002)
+
+
+def dump_mmc1(d, path, mirror="h", prg_banks=2, chr_banks=4):
+    d.set_mode(MODE_PRG)
+    ctrl = (0 << 4) | (2 << 2) | (2 if mirror == "h" else 3)
+    mmc1_write(d, MMC1_REG_CTRL, ctrl)
+
+    prg = bytearray()
+    for n in range(prg_banks):
+        mmc1_write(d, MMC1_REG_PRG, n)
+        prg += d.prg_read(0x8000, 16 * 1024, verify=True)
+        _bar("PRG", len(prg), prg_banks * 16 * 1024)
+    print()
+
+    # 生の$C000直読みはしない(境界越えで化けることが分かっている、MMC3と同じ理由)。
+    # 同じ$8000窓を、同じPRGバンクレジスタ経由で読み直して突き合わせる。
+    v = prg[-6:]
+    vectors = {"NMI": v[1] << 8 | v[0], "RESET": v[3] << 8 | v[2], "IRQ": v[5] << 8 | v[4]}
+    problems = []
+    for name, addr in vectors.items():
+        if not 0x8000 <= addr <= 0xFFFF:
+            problems.append(f"{name}ベクタ ${addr:04X} が $8000-$FFFF の外")
+    for bank in range(prg_banks):
+        mmc1_write(d, MMC1_REG_PRG, bank)
+        again = d.prg_read(0x8000, 64)
+        expect = prg[bank * 16384: bank * 16384 + 64]
+        if again != expect:
+            problems.append(f"バンク{bank}の再読が不一致($8000窓経由)")
+    print("  ベクタ " + " ".join(f"{k}=${v:04X}" for k, v in vectors.items()))
+    if problems:
+        print("\n★ 検証に失敗した。書き出さない:")
+        for p in problems:
+            print("   -", p)
+        raise DumperError("PRGの検証に失敗")
+    print("  PRG検証 OK")
+
+    d.set_mode(MODE_CHR)
+    chr_data = bytearray()
+    for n in range(chr_banks):
+        mmc1_write(d, MMC1_REG_CHR0, n)
+        chr_data += d.chr_read(0x0000, 8 * 1024, verify=True)
+        _bar("CHR", len(chr_data), chr_banks * 8 * 1024)
+    print()
+
+    bad = _sanity_bits(bytes(prg), "PRG") + _sanity_bits(bytes(chr_data), "CHR")
+    if bad:
+        print("★ ビット分布が不自然。書き出さない:")
+        for b in bad:
+            print("   -", b)
+        raise DumperError("ビット分布の健全性チェックに失敗: " + ", ".join(bad))
+    print("  ビット分布チェック OK")
+
+    d.set_mode(MODE_IDLE)
+    write_ines(path, bytes(prg), bytes(chr_data), mapper=1, mirror=mirror)
+
+
 # ---------------------------------------------------------------- MMC3 (Mapper 4)
 #
 # レジスタは $8000/$8001 だけで足りる。書き込み自体は prg_write() が
@@ -628,7 +710,7 @@ def main():
     w.add_argument("value")
 
     dp = sub.add_parser("dump")
-    dp.add_argument("mapper", choices=["nrom", "m87", "mmc3"])
+    dp.add_argument("mapper", choices=["nrom", "m87", "mmc1", "mmc3"])
     dp.add_argument("out")
     dp.add_argument("--mirror", choices=["h", "v"], default="h")
     dp.add_argument("--chr", type=lambda s: int(s, 0), default=8192)
@@ -669,6 +751,8 @@ def main():
         elif a.cmd == "dump":
             if a.mapper == "m87":
                 dump_m87(d, a.out, mirror=a.mirror)
+            elif a.mapper == "mmc1":
+                dump_mmc1(d, a.out, mirror=a.mirror)
             elif a.mapper == "mmc3":
                 dump_mmc3(d, a.out, mirror=a.mirror,
                            prg_banks=a.prg_banks, chr_banks=a.chr_banks)
