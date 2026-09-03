@@ -262,9 +262,9 @@ static void cmdChrRead(uint16_t addr, uint16_t n) {
     i2cCmd3(CHR328_ADDR, C_SET_ADDR, (uint8_t)(a & 0xFF), (uint8_t)(a >> 8));
     setChrA12((uint8_t)((a >> 12) & 1));
     uint8_t lo, hi;
-    if (!i2cGet(CHR328_ADDR, &lo)) lo = 0xFF;   // D0-D4 が bit0-4
-    if (!i2cGet(NANO_ADDR, &hi))   hi = 0xFF;   // D5-D7 が bit5-7
-    Serial.write((uint8_t)((lo & 0x1F) | (hi & 0xE0)));
+    if (!i2cGet(CHR328_ADDR, &lo)) lo = 0xFF;   // D0-D3 が bit0-3(328P)
+    if (!i2cGet(NANO_ADDR, &hi))   hi = 0xFF;   // D4-D7 が bit4-7(Nano。D4は328PのPB5故障により移設)
+    Serial.write((uint8_t)((lo & 0x0F) | (hi & 0xF0)));
   }
   Serial.flush();
 }
@@ -494,7 +494,7 @@ static void monReadChr(uint16_t addr) {
   char l1[22], l2[22];
   snprintf(l1, sizeof(l1), "CHR $%04X", addr);
   if (okAddr && okLo && okHi) {
-    const uint8_t v = (uint8_t)((lo & 0x1F) | (hi & 0xE0));
+    const uint8_t v = (uint8_t)((lo & 0x0F) | (hi & 0xF0));
     Serial.print(F("0x")); Serial.println(v, HEX);
     snprintf(l2, sizeof(l2), "= 0x%02X", v);
   } else {

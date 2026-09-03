@@ -30,10 +30,21 @@
 //   PC0-PC2 = A0-A2   -> CHR D5-D7    (カート 59,58,57番)
 //   PC3     = A3      -> CHR A13      (カート 56番)
 //   PC4/PC5 = A4/A5   -> I2C
-//   PD0/PD1 = D0/D1   -> 空き
+//   PD0     = D0      -> 空き(USBシリアルのRX。ここは使わない、下記参照)
+//   PD1     = D1      -> CHR D4       (カート 60番。328PのPB5が壊れたため移設)
 //
 //   ※ D13 は VRAM /RD に取られている。基板上LEDはこの線と一緒に光るだけで、
 //      状態表示には使えない。常に出力なので線を乱すことはない。
+//
+//   ※ CHR D4 は本来 裸328P の PB5(19番/SCK兼用)が担当していたが、
+//      3枚のチップ全てで同じ壊れ方(内部プルアップを有効にしても常にLow固定、
+//      配線を完全に外して孤立させても直らない)が確定したため、Nano へ移設した。
+//      D0(RX)ではなく D1(TX)を選んだ理由:
+//      USBシリアル変換チップ(CH340等)からD0(RX)は常に駆動されている
+//      (UARTのアイドル時もHighを能動的に押している)ので、そこにカートの
+//      信号を重ねるとバス競合になり、別の固定化けを生むだけ。
+//      D1(TX)側はCH340から見て受信専用の入力で、こちらのUART送信回路も
+//      Serial.begin()を呼ばない限り眠ったままなので、駆動が衝突しない。
 
 #include <Arduino.h>
 #include <Wire.h>
@@ -95,9 +106,10 @@ static void prgDataDir(bool out) {
   }
 }
 
-// CHR D5-D7 は PC0-PC2。返す位置(bit5-7)に合わせて詰める。
+// CHR D5-D7 は PC0-PC2、CHR D4 は PD1(328PのPB5故障により移設)。
+// 返す位置(bit4-7)に合わせて詰める。
 static inline uint8_t readChrHigh(void) {
-  return (uint8_t)((PINC & 0x07) << 5);
+  return (uint8_t)(((PINC & 0x07) << 5) | ((PIND & 0x02) << 3));
 }
 
 static void chrDataDir(bool out) {
@@ -211,6 +223,10 @@ void setup() {
   DDRD &= 0x03;
   DDRB &= (uint8_t)~0x3F;
   DDRC &= (uint8_t)~0x0F;
+
+  // CHR D4(PD1)は常に入力・常にプルアップでよい。他のデータ線と違って
+  // 出力に切り替える場面が無いので、モードごとに触らずここで固定する。
+  PORTD |= 0x02;
 
   setMode(MODE_IDLE);
 
