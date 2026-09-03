@@ -52,7 +52,10 @@ STATUS = {0x00: "OK", 0x01: "未知のコマンド", 0x02: "スレーブ応答�
 CHUNK = 1024
 
 # 二重読みが一致しないときに諦めるまでの回数。
-MAX_RETRY = 24
+# 以前は24回(数秒)だったが、装置の「不調の波」は数分続くことがある
+# (TwinBeeのdump_resilient.pyで実測済み)ため、数分規模の粘りに広げた。
+# 一致すれば即抜けるので、既に安定している読みには影響しない。
+MAX_RETRY = 300
 
 
 class DumperError(Exception):
@@ -153,7 +156,7 @@ class Dumper:
         prev = self._chunk(cmd, a, k, timeout)
         for attempt in range(MAX_RETRY):
             if attempt >= 2:
-                time.sleep(0.05)          # 少し休ませるだけで通ることがある
+                time.sleep(1.0)           # 少し休ませるだけで通ることがある
             if attempt and attempt % 4 == 0:
                 self._recover()           # 休んでも駄目ならモードごと入れ直す
                 prev = self._chunk(cmd, a, k, timeout)
@@ -366,6 +369,222 @@ def dump_nrom(d, path, mirror="h", chr_size=8 * 1024):
     write_ines(path, prg, chr_data, mapper=0, mirror=mirror)
 
 
+# ---------------------------------------------------------------- MMC3 (Mapper 4)
+#
+# レジスタは $8000/$8001 だけで足りる。書き込み自体は prg_write() が
+# アドレスのbit15を見て/ROMSELの扱いを自動で切り替えてくれるので
+# (cmdPrgWrite: romselActive = (a & 0x8000) ? 1 : 0)、Mapper87のときのように
+# 「$6000-$7FFFという窓の外に書く」工夫は要らない。MMC3自体がASICのマッパーで、
+# 書き込み中はPRG ROMの出力を自分で止める設計になっているため、実機のゲームが
+# 常時これをやっている通り、素直に書けばよい。
+#
+# $8000(偶数アドレス、どこでもよいが$8000を使う):
+#   bit7   CHR A12反転 (0=標準 / 1=反転)
+#   bit6   PRGモード   (0: $8000-$9FFFがR6で切替 / 1: $C000-$DFFFがR6で切替)
+#   bit2-0 次に$8001へ書く値がどのレジスタ(R0-R7)向けか
+# $8001: 選んだレジスタへバンク番号を書く
+#
+# ダンプに使うのはR6(PRG 8KB窓)とR2(CHR 1KB窓)だけ。R7やR0/R1、
+# $A000のミラーリングレジスタはダンプでは触らない(表示用の設定であって
+# ROMの中身には関係ない)。IRQ関連レジスタも同様、触る必要が無い。
+#
+# PRGは $E000-$FFFF が常に最終バンク固定という性質を使い、R6経由で
+# 読んだバンクの中身がそれと一致する回を探して総バンク数を自動判定する。
+# CHRには同じ「固定窓」が無いので、バンク0とバンクKを比べて一致し始める
+# 最小のK(=物理容量を超えて折り返す境目)を総バンク数とみなす。
+
+MMC3_R_CHR_1K_A = 2   # $1000-$13FF (CHR A12反転なし時)
+MMC3_R_PRG_LOW  = 6   # $8000-$9FFF (PRGモード0時)
+
+
+def mmc3_select(d, mode_bits, reg):
+    d.prg_write(0x8000, (mode_bits & 0xC0) | (reg & 0x07))
+
+
+def mmc3_bank(d, bank):
+    d.prg_write(0x8001, bank & 0xFF)
+
+
+def _fuzzy_match(a, b, min_ratio=0.85):
+    """$C000系境界を跨ぐ読みは先頭32-58バイト程度が化けることがある
+    (ダックハントの調査で確認済み。原因未特定、うちの装置固有)。
+    完全一致ではなく、大部分が一致していればよしとする。"""
+    if len(a) != len(b):
+        return False
+    same = sum(1 for x, y in zip(a, b) if x == y)
+    return same / len(a) >= min_ratio
+
+
+def detect_mmc3_prg_banks(d, max_banks=64, sample=512):
+    """$E000-$FFFF(常に最終バンク固定)と一致するバンク番号を探す。
+
+    完全一致ではなくファジーマッチ: $E000読み取り自体が境界越えの影響で
+    先頭が化けることがあるため、サンプルを大きめに取り大部分の一致で判定する。
+    """
+    fixed = d.prg_read(0xE000, sample, verify=True)
+    for n in range(1, max_banks + 1):
+        mmc3_select(d, 0x00, MMC3_R_PRG_LOW)
+        mmc3_bank(d, n - 1)
+        got = d.prg_read(0x8000, sample)
+        if _fuzzy_match(got, fixed):
+            return n
+    raise DumperError(f"MMC3のPRGバンク数を自動判定できない({max_banks}バンク="
+                       f"{max_banks * 8}KBまで試した)")
+
+
+def detect_mmc3_chr_banks(d, max_banks=256, sample=64):
+    """バンク0と一致し始める最小のKを、物理容量からの折り返しとみなす。"""
+    mmc3_select(d, 0x00, MMC3_R_CHR_1K_A)
+    mmc3_bank(d, 0)
+    bank0 = d.chr_read(0x1000, sample, verify=True)
+    k = 1
+    while k <= max_banks:
+        mmc3_select(d, 0x00, MMC3_R_CHR_1K_A)
+        mmc3_bank(d, k)
+        if d.chr_read(0x1000, sample) == bank0:
+            return k
+        k *= 2
+    raise DumperError(f"MMC3のCHRバンク数を自動判定できない({max_banks}バンク="
+                       f"{max_banks}KBまで試した)")
+
+
+def verify_prg_mmc3(d, prg, prg_banks):
+    """MMC3専用の検証。生の$C000/$E000直読みはしない。
+
+    そこは「$Bxxx→$Cxxxのようにアドレス線の多数ビットが同時に反転する境界」で
+    読み取りが化けることが分かっている(ダックハントの調査で確認済み)。
+    本編のバンク読み取りはR6経由で常に$8000-$9FFFという同じアドレスしか
+    使わないので、この境界を一度も踏んでいない。検証もR6経由の再読みで行う。
+    """
+    problems = []
+    v = prg[-6:]
+    vectors = {"NMI": v[1] << 8 | v[0], "RESET": v[3] << 8 | v[2], "IRQ": v[5] << 8 | v[4]}
+    for name, addr in vectors.items():
+        if not 0x8000 <= addr <= 0xFFFF:
+            problems.append(f"{name}ベクタ ${addr:04X} が $8000-$FFFF の外")
+
+    # 最終バンクと最終から2番目のバンクを、同じR6経由アドレスで読み直して突き合わせる
+    # (R6経由の$8000読みなので$C000系境界は踏んでいない。ここは完全一致でよい)
+    for bank in (prg_banks - 1, max(prg_banks - 2, 0)):
+        mmc3_select(d, 0x00, MMC3_R_PRG_LOW)
+        mmc3_bank(d, bank)
+        again = d.prg_read(0x8000, 64)
+        expect = prg[bank * 8192: bank * 8192 + 64]
+        if again != expect:
+            problems.append(f"バンク{bank}の再読が不一致(R6経由、$C000系境界は踏んでいない)")
+
+    if len(prg) >= 2048 and prg[:1024] == prg[1024:2048]:
+        problems.append("先頭2KBが1KB周期で重複(アドレス線の折り返し)")
+
+    return vectors, problems
+
+
+def _sanity_bits(data, label, lo=0.15, hi=0.85):
+    """ビットごとの1の割合が健全な範囲(既定15-85%)に収まっているか。
+    0%や100%に張り付くのは、その配線・その番地が化けている実測に基づく目安。"""
+    bad = []
+    for bit in range(8):
+        ratio = sum((b >> bit) & 1 for b in data) / len(data)
+        if not (lo <= ratio <= hi):
+            bad.append(f"{label} D{bit}: {ratio*100:.1f}%")
+    return bad
+
+
+def _bank_health(d, cmd_read, addr, n=6):
+    """今選んでいるバンクの16バイトを何度か読み、自分自身と一致する割合を見る。
+
+    MMC3はバンクごとに中身が変わるので、TwinBeeのdump_resilient.pyのような
+    既知の正解値(TRUTH16)は使えない。代わりに「毎回同じ値が返るか」で
+    健全性を測る。装置には好調な波と不調な波があり、不調な最中は同じ番地でも
+    読むたびに違う値が返る(実測)。
+    """
+    vals = []
+    for _ in range(n):
+        try:
+            vals.append(cmd_read(d, addr, 16))
+        except (DumperError, Exception):
+            vals.append(None)
+    if not vals or vals[0] is None:
+        return 0.0
+    good = sum(1 for v in vals if v == vals[0])
+    return good / n
+
+
+def _wait_bank_healthy(d, cmd_read, addr, label, need=0.8, max_wait=600, log=print):
+    t0 = time.time()
+    i = 0
+    while time.time() - t0 < max_wait:
+        h = _bank_health(d, cmd_read, addr)
+        if h >= need:
+            if i:
+                log(f"    {label}: 好調になった(一致率 {h:.0%})。読み出しを再開")
+            return True
+        if i % 10 == 0:
+            log(f"    {label}: 不調(一致率 {h:.0%})。好調な波を待つ ({i}回目)")
+        time.sleep(2)
+        i += 1
+    return False
+
+
+def dump_mmc3(d, path, mirror="h", prg_banks=None, chr_banks=None):
+    d.set_mode(MODE_PRG)
+    if prg_banks is None:
+        prg_banks = detect_mmc3_prg_banks(d)
+    print(f"PRG {prg_banks}バンク({prg_banks * 8}KB)と判定")
+
+    def _read16(dd, a, n):
+        return dd.prg_read(a, n)
+
+    prg = bytearray()
+    for n in range(prg_banks):
+        mmc3_select(d, 0x00, MMC3_R_PRG_LOW)
+        mmc3_bank(d, n)
+        if not _wait_bank_healthy(d, _read16, 0x8000, f"PRGバンク{n}"):
+            raise DumperError(f"PRGバンク{n}: 好調な波が来ない(最大待機時間超過)")
+        prg += d.prg_read(0x8000, 8 * 1024, verify=True)
+        _bar("PRG", len(prg), prg_banks * 8 * 1024)
+    print()
+
+    vectors, problems = verify_prg_mmc3(d, bytes(prg), prg_banks)
+    print("  ベクタ " + " ".join(f"{k}=${v:04X}" for k, v in vectors.items()))
+    if problems:
+        print("\n★ 検証に失敗した。書き出さない:")
+        for p in problems:
+            print("   -", p)
+        raise DumperError("PRGの検証に失敗")
+    print("  PRG検証 OK")
+
+    d.set_mode(MODE_CHR)
+    if chr_banks is None:
+        chr_banks = detect_mmc3_chr_banks(d)
+    print(f"CHR {chr_banks}バンク({chr_banks}KB)と判定")
+
+    def _read16_chr(dd, a, n):
+        return dd.chr_read(a, n)
+
+    chr_data = bytearray()
+    for n in range(chr_banks):
+        mmc3_select(d, 0x00, MMC3_R_CHR_1K_A)
+        mmc3_bank(d, n)
+        if not _wait_bank_healthy(d, _read16_chr, 0x1000, f"CHRバンク{n}"):
+            raise DumperError(f"CHRバンク{n}: 好調な波が来ない(最大待機時間超過)")
+        chr_data += d.chr_read(0x1000, 1024, verify=True)
+        _bar("CHR", len(chr_data), chr_banks * 1024)
+    print()
+
+    # 書き出す前の最終防波堤: ビット分布が不自然なら偽の成功として弾く
+    bad = _sanity_bits(bytes(prg), "PRG") + _sanity_bits(bytes(chr_data), "CHR")
+    if bad:
+        print("★ ビット分布が不自然。書き出さない:")
+        for b in bad:
+            print("   -", b)
+        raise DumperError("ビット分布の健全性チェックに失敗: " + ", ".join(bad))
+    print("  ビット分布チェック OK")
+
+    d.set_mode(MODE_IDLE)
+    write_ines(path, bytes(prg), bytes(chr_data), mapper=4, mirror=mirror)
+
+
 def write_ines(path, prg, chr_data, mapper=0, mirror="h"):
     """iNES(.nes)として書き出す。
 
@@ -409,10 +628,14 @@ def main():
     w.add_argument("value")
 
     dp = sub.add_parser("dump")
-    dp.add_argument("mapper", choices=["nrom", "m87"])
+    dp.add_argument("mapper", choices=["nrom", "m87", "mmc3"])
     dp.add_argument("out")
     dp.add_argument("--mirror", choices=["h", "v"], default="h")
     dp.add_argument("--chr", type=lambda s: int(s, 0), default=8192)
+    dp.add_argument("--prg-banks", type=int, default=None,
+                     help="MMC3: 8KB単位のPRGバンク総数を手動指定(既定は自動判定)")
+    dp.add_argument("--chr-banks", type=int, default=None,
+                     help="MMC3: 1KB単位のCHRバンク総数を手動指定(既定は自動判定)")
 
     wk = sub.add_parser("walk")
     wk.add_argument("index", type=int)
@@ -446,6 +669,9 @@ def main():
         elif a.cmd == "dump":
             if a.mapper == "m87":
                 dump_m87(d, a.out, mirror=a.mirror)
+            elif a.mapper == "mmc3":
+                dump_mmc3(d, a.out, mirror=a.mirror,
+                           prg_banks=a.prg_banks, chr_banks=a.chr_banks)
             else:
                 dump_nrom(d, a.out, mirror=a.mirror, chr_size=a.chr)
         elif a.cmd == "walk":
