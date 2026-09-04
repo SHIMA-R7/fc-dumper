@@ -2,6 +2,13 @@
 
 ロジックIC不使用。3台の ATmega328P に 48 本の信号を分担させ、I2C で束ねる。
 
+## 実機写真
+
+| | |
+|---|---|
+| ![正面](docs/photos/01_front.jpg) 正面(ドラクエ3挿入時) | ![電源・OLED](docs/photos/02_power_monitor.jpg) 電源とOLEDモニター |
+| ![裏面配線](docs/photos/03_wiring_back.jpg) 裏面のUEW空中配線 | ![パーツ一覧](docs/photos/04_parts.jpg) 使用パーツ一式 |
+
 ## 構成
 
 | チップ | 担当 | I2C |

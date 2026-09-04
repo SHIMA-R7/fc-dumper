@@ -51,14 +51,28 @@
 // 描画するわけではない(チャンクの先頭でだけ更新)ので問題にならない。
 U8G2_SH1106_128X64_NONAME_1_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
-static void oledShow(const char *l1, const char *l2 = nullptr, const char *l3 = nullptr) {
+static void oledShow(const char *l1, const char *l2 = nullptr, const char *l3 = nullptr,
+                      const char *l4 = nullptr) {
   oled.firstPage();
   do {
     oled.setFont(u8g2_font_6x10_tr);
     if (l1) oled.drawStr(0, 11, l1);
     if (l2) oled.drawStr(0, 27, l2);
     if (l3) oled.drawStr(0, 43, l3);
+    if (l4) oled.drawStr(0, 59, l4);
   } while (oled.nextPage());
+}
+
+// セッション中の累計バイト数(電源を入れてから)。読み出しコマンドの
+// 開始・終了時だけOLEDに出す(ループ中に更新すると化けるため、下記参照)。
+static uint32_t g_prgTotal = 0;
+static uint32_t g_chrTotal = 0;
+
+static void oledShowIo(const char *label, uint16_t addr, uint16_t n, uint32_t total) {
+  char l2[22], l3[22];
+  snprintf(l2, sizeof(l2), "$%04X +%u", addr, n);
+  snprintf(l3, sizeof(l3), "total %luB", (unsigned long)total);
+  oledShow(label, l2, l3);
 }
 
 #define NANO_ADDR   0x20
@@ -210,11 +224,13 @@ static bool setMode(uint8_t m) {
   }
   g_mode = m;
 
-  char l2[22];
+  char l2[22], l3[22];
   snprintf(l2, sizeof(l2), "Nano:%s 328P:%s",
            i2cPresent(NANO_ADDR)   ? "OK" : "NG",
            i2cPresent(CHR328_ADDR) ? "OK" : "NG");
-  oledShow(m == MODE_IDLE ? "mode: IDLE" : (m == MODE_PRG ? "mode: PRG" : "mode: CHR"), l2);
+  snprintf(l3, sizeof(l3), "PRG%luB CHR%luB",
+           (unsigned long)g_prgTotal, (unsigned long)g_chrTotal);
+  oledShow(m == MODE_IDLE ? "mode: IDLE" : (m == MODE_PRG ? "mode: PRG" : "mode: CHR"), l2, l3);
 
   return ok;
 }
@@ -239,11 +255,15 @@ static void replyBuf(const uint8_t *b, uint16_t n) {
 // ---------------------------------------------------------------- 読み出し
 
 // PRG。/ROMSEL は本来 !(A15 & M2) なので、A15 が変わる境界でだけ Nano に伝える。
+static uint8_t g_prgCallCount = 0;
+
 static void cmdPrgRead(uint16_t addr, uint16_t n) {
   int8_t romselNow = -1;
-  // ここでOLEDを更新しない。1回の描画は約1KBのI2C通信で、それを読み出しと
-  // 同じバスへ毎チャンク流すことになる。32KBのダンプなら32回。
-  // 実際、長い読みほど壊れるという症状が出た。表示より正しさを取る。
+  // ループの中では絶対にOLEDを更新しない(読み出しと同じI2Cバスに割り込む
+  // ので、実際「長い読みほど壊れる」症状が出た)。呼び出しごとに描画する
+  // のも同じ理由でNG(1回のダンプはCHUNK=1KBごとに何十回もこの関数が
+  // 呼ばれるため)。8回に1回だけ、間引いて表示する。
+  if ((g_prgCallCount++ & 0x07) == 0) oledShowIo("PRG read", addr, n, g_prgTotal);
   sendHeader(ST_OK, n);
   for (uint16_t i = 0; i < n; i++) {
     const uint16_t a = (uint16_t)(addr + i);
@@ -265,11 +285,15 @@ static void cmdPrgRead(uint16_t addr, uint16_t n) {
     Serial.write(d);
   }
   Serial.flush();
+  g_prgTotal += n;   // OLEDには描かない(次回の間引き描画で反映される)
 }
+
+static uint8_t g_chrCallCount = 0;
 
 // CHR。窓は A0-A12 の 8KB 固定。それ以上はマッパーでバンクを切り替える(PC側の仕事)。
 static void cmdChrRead(uint16_t addr, uint16_t n) {
-  // PRG側と同じ理由でOLEDは触らない。
+  // PRG側と同じ理由で、ループ中は触らない。呼び出し8回に1回だけ間引いて表示。
+  if ((g_chrCallCount++ & 0x07) == 0) oledShowIo("CHR read", addr, n, g_chrTotal);
   sendHeader(ST_OK, n);
   for (uint16_t i = 0; i < n; i++) {
     const uint16_t a = (uint16_t)(addr + i) & 0x1FFF;
@@ -281,6 +305,7 @@ static void cmdChrRead(uint16_t addr, uint16_t n) {
     Serial.write((uint8_t)((lo & 0x0F) | (hi & 0xF0)));
   }
   Serial.flush();
+  g_chrTotal += n;
 }
 
 // ---------------------------------------------------------------- コマンド処理
