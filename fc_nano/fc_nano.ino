@@ -178,6 +178,29 @@ static void prgWriteCycle(uint8_t d, uint8_t romselActive) {
   applyCtrl(g_ctrl);                              // 読みの状態へ戻す
 }
 
+// MMC1(+SRAM基板)専用: /ROMSEL↑ と M2↓ を1回のPORTB書き込みで同時に切る。
+// sanniのcartreader実装のコメントより: この2つの遷移が33ns以上離れると、
+// $E000/$F000への書き込みが$6000/$7000のSRAM側と衝突して化ける
+// (2026-09-04, ドラゴンクエストIII調査時に発見。通常のprgWriteCycleは
+// この2遷移を別々のapplyCtrl呼び出しに分けているため、規定を満たせない)。
+static void prgWriteCycleFast(uint8_t d, uint8_t romselActive) {
+  const uint8_t base = CTL_CHRRD | CTL_A13;
+
+  applyCtrl(base | CTL_RW | CTL_ROMSEL);          // まず解除。ROMの出力を止める
+  prgDataDir(true);
+  writePrgData(d);
+  applyCtrl(base | CTL_ROMSEL);                   // R/W を Low へ
+  delayMicroseconds(1);
+
+  applyCtrl(base | CTL_M2 | (romselActive ? 0 : CTL_ROMSEL));   // M2↑ /ROMSEL↓
+  delayMicroseconds(2);
+  applyCtrl(base | CTL_ROMSEL);                   // /ROMSEL↑ と M2↓ を同時に(1回のPORTB書き込み)
+  delayMicroseconds(1);
+
+  prgDataDir(false);
+  applyCtrl(g_ctrl);
+}
+
 static uint8_t prgReadCycle(void) {
   if (!g_pulse) return readPrgData();             // 静的: もう出力は出ている
 
@@ -196,15 +219,16 @@ static uint8_t prgReadCycle(void) {
 static void onReceive(int n) {
   if (n < 1) return;
   const uint8_t cmd = (uint8_t)Wire.read();
-  uint8_t a = 0, b = 0;
+  uint8_t a = 0, b = 0, c = 0;
   if (n >= 2) a = (uint8_t)Wire.read();
   if (n >= 3) b = (uint8_t)Wire.read();
+  if (n >= 4) c = (uint8_t)Wire.read();
   while (Wire.available()) Wire.read();
 
   switch (cmd) {
     case N_SET_MODE:  setMode(a); break;
     case N_SET_CTRL:  g_ctrl = a; applyCtrl(g_ctrl); break;
-    case N_PRG_WRITE: prgWriteCycle(a, b); break;
+    case N_PRG_WRITE: if (c) prgWriteCycleFast(a, b); else prgWriteCycle(a, b); break;
     case N_SET_CYCLE: g_pulse = a ? 1 : 0; break;
     default: break;
   }

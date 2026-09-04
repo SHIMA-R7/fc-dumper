@@ -88,6 +88,10 @@ static void oledShow(const char *l1, const char *l2 = nullptr, const char *l3 = 
 #define CMD_PING       0x01
 #define CMD_SET_MODE   0x02
 #define CMD_PRG_READ   0x03
+
+// 実験用: cmdPrgReadの最初の1バイト(=大きなアドレス跳躍の直後)だけ挟む
+// settle待ち。値を変えて再アップロードし、化けるバイト数の変化を見る。
+#define PRG_JUMP_SETTLE_US 0
 #define CMD_PRG_WRITE  0x04
 #define CMD_CHR_READ   0x05
 #define CMD_SET_ADDR   0x06   // 診断: PRGアドレスを固定して置く
@@ -149,6 +153,11 @@ static bool i2cCmd2(uint8_t addr, uint8_t a, uint8_t b) {
 static bool i2cCmd3(uint8_t addr, uint8_t a, uint8_t b, uint8_t c) {
   const uint8_t t[3] = {a, b, c};
   return i2cCmd(addr, t, 3);
+}
+
+static bool i2cCmd4(uint8_t addr, uint8_t a, uint8_t b, uint8_t c, uint8_t e) {
+  const uint8_t t[4] = {a, b, c, e};
+  return i2cCmd(addr, t, 4);
 }
 
 // スレーブに1バイト吐かせる。居なければ false。
@@ -246,6 +255,11 @@ static void cmdPrgRead(uint16_t addr, uint16_t n) {
       romselNow = (int8_t)romsel;
     }
     setPrgAddr(a);
+    // 実験: アドレス下位バイトがちょうど0x00になる読みだけ化ける不具合の
+    // 切り分け(2026-09-04, ダックハント)。ジャンプ幅・待ち時間(500µsまで)
+    // ともに無関係と判明済み。ROMチップ内部のページ単位プリチャージ等を
+    // 疑い、下位バイト0のときだけもっと長く待ってみる。
+    if ((a & 0xFF) == 0) delayMicroseconds(PRG_JUMP_SETTLE_US);
     uint8_t d;
     if (!i2cGet(NANO_ADDR, &d)) d = 0xFF;   // Nanoが居なければ開放と同じ 0xFF
     Serial.write(d);
@@ -317,12 +331,15 @@ static void handle(uint8_t cmd, const uint8_t *p, uint16_t len) {
     case CMD_PRG_WRITE: {
       // マッパーのレジスタ書き込み。アドレスはこちらが出し、
       // データ線と R/W の操作は Nano がやる。
-      if (len != 3) { reply(ST_BAD_LEN); return; }
+      // len==4のとき p[3] は「高速ラッチ」フラグ(MMC1+SRAM基板向け、
+      // /ROMSEL↑とM2↓を1回のポート書き込みで同時に切る)。省略時は0(従来通り)。
+      if (len != 3 && len != 4) { reply(ST_BAD_LEN); return; }
       if (g_mode != MODE_PRG) setMode(MODE_PRG);
       const uint16_t a = (uint16_t)(p[0] | (p[1] << 8));
       setPrgAddr(a);
-      const bool ok = i2cCmd3(NANO_ADDR, N_PRG_WRITE, p[2],
-                              (uint8_t)((a & 0x8000) ? 1 : 0));
+      const uint8_t fast = (len == 4) ? p[3] : 0;
+      const bool ok = i2cCmd4(NANO_ADDR, N_PRG_WRITE, p[2],
+                              (uint8_t)((a & 0x8000) ? 1 : 0), fast);
       reply(ok ? ST_OK : ST_NO_SLAVE);
       return;
     }

@@ -14,3 +14,7 @@ probe*.txt
 build/
 *.hex
 *.elf
+
+# 参照用に落とした他プロジェクト(sanniのcartreader等)。自分のリポジトリには含めない
+reference/
+overnight_log.txt

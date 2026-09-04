@@ -183,8 +183,11 @@ class Dumper:
             print()
         return bytes(out)
 
-    def prg_write(self, addr, value):
-        self._txn(CMD_PRG_WRITE, bytes([addr & 0xFF, (addr >> 8) & 0xFF, value & 0xFF]))
+    def prg_write(self, addr, value, fast=False):
+        payload = bytes([addr & 0xFF, (addr >> 8) & 0xFF, value & 0xFF])
+        if fast:
+            payload += bytes([1])
+        self._txn(CMD_PRG_WRITE, payload)
 
     def chr_read(self, addr, n, progress=False, verify=False):
         out = bytearray()
@@ -314,6 +317,11 @@ def verify_prg(d, prg, base):
     if len(prg) >= 2048 and prg[:1024] == prg[1024:2048]:
         problems.append("先頭2KBが1KB周期で重複(アドレス線の折り返し)")
 
+    # 4. ビットごとの分布。特定ビットが0%/100%に張り付くのは、
+    # 「読めた」の顔をした実際の化け。F1レースでD0が100%固定のまま
+    # 検証をすり抜けたことがある(2026-09-04)。
+    problems += _sanity_bits(prg, "PRG")
+
     return vectors, problems
 
 
@@ -356,17 +364,177 @@ def dump_m87(d, path, mirror="v"):
     write_ines(path, prg, chr_data, mapper=87, mirror=mirror)
 
 
-def dump_nrom(d, path, mirror="h", chr_size=8 * 1024):
+def dump_nrom(d, path, mirror="h", chr_size=8 * 1024, chr_votes=5):
+    from collections import Counter
+
     d.set_mode(MODE_PRG)
     prg_size = detect_prg_size(d)
     print(f"PRG {prg_size // 1024}KB と判定")
-    prg = d.prg_read(0x10000 - prg_size, prg_size, progress=True)
+    base = 0x10000 - prg_size
+    prg = d.prg_read(base, prg_size, progress=True, verify=True)
 
-    d.set_mode(MODE_CHR)
-    chr_data = d.chr_read(0, chr_size, progress=True) if chr_size else b""
+    vectors, problems = verify_prg(d, prg, base)
+    print("  ベクタ " + " ".join(f"{k}=${v:04X}" for k, v in vectors.items()))
+    if problems:
+        print("\n★ 検証に失敗した。書き出さない:")
+        for p in problems:
+            print("   -", p)
+        raise DumperError("PRGの検証に失敗")
+    print("  PRG検証 OK")
+
+    chr_data = b""
+    if chr_size:
+        d.set_mode(MODE_CHR)
+        print(f"CHR {chr_size // 1024}KBを{chr_votes}回読んで多数決")
+        runs = [d.chr_read(0, chr_size, progress=True) for _ in range(chr_votes)]
+        chr_data = bytes(Counter(bs).most_common(1)[0][0] for bs in zip(*runs))
+        bad = _sanity_bits(chr_data, "CHR")
+        if bad:
+            print("\n★ CHRのビット分布が不自然。書き出さない:")
+            for b in bad:
+                print("   -", b)
+            raise DumperError("CHRのビット分布チェックに失敗: " + ", ".join(bad))
+        print("  CHR検証 OK")
 
     d.set_mode(MODE_IDLE)
     write_ines(path, prg, chr_data, mapper=0, mirror=mirror)
+
+
+# ---------------------------------------------------------------- CNROM (Mapper 3)
+#
+# PRGは32KB固定でバンク切り替えなし(NROMと同じ)。CHRだけ、$8000-$FFFFの
+# どこでもよい1回の書き込みでバンクが切り替わる(MMC1のようなシリアル手順は
+# 不要)。PRG ROMにマッパーロジックが無く/CEが/ROMSELに直結のままなので、
+# 書き込み中はROMも出力しようとするが、prg_write()が既に/ROMSELを一旦
+# 解除してから書く設計になっている(Mapper87やMMC3のときと同じ)ため、
+# 追加のバスコンフリクト対策は要らない。
+#
+# テトリス(BPS/Japan)で確認した実際の構成(Web調査): PRG 32KB(固定)、
+# CHR 16KB(8KB×2バンク)、水平ミラーリング。
+def dump_cnrom(d, path, mirror="h", chr_banks=2):
+    d.set_mode(MODE_PRG)
+    prg_size = detect_prg_size(d)
+    print(f"PRG {prg_size // 1024}KB と判定(CNROMはバンク切替なし)")
+    base = 0x10000 - prg_size
+    prg = d.prg_read(base, prg_size, progress=True, verify=True)
+
+    vectors, problems = verify_prg(d, prg, base)
+    print("  ベクタ " + " ".join(f"{k}=${v:04X}" for k, v in vectors.items()))
+    if problems:
+        print("\n★ 検証に失敗した。書き出さない:")
+        for p in problems:
+            print("   -", p)
+        raise DumperError("PRGの検証に失敗")
+    print("  PRG検証 OK")
+
+    d.set_mode(MODE_CHR)
+    chr_data = bytearray()
+    for n in range(chr_banks):
+        d.set_mode(MODE_PRG)
+        d.prg_write(0x8000, n)
+        d.set_mode(MODE_CHR)
+        chr_data += d.chr_read(0x0000, 8 * 1024, verify=True)
+        print(f"  CHRバンク{n} 取得(書込値 {n})")
+
+    bad = _sanity_bits(bytes(prg), "PRG") + _sanity_bits(bytes(chr_data), "CHR")
+    if bad:
+        print("★ ビット分布が不自然。書き出さない:")
+        for b in bad:
+            print("   -", b)
+        raise DumperError("ビット分布の健全性チェックに失敗: " + ", ".join(bad))
+    print("  ビット分布チェック OK")
+
+    d.set_mode(MODE_IDLE)
+    write_ines(path, prg, bytes(chr_data), mapper=3, mirror=mirror)
+
+
+# ---------------------------------------------------------------- UNROM (Mapper 2)
+#
+# $8000-$FFFFのどこでもよい1回の書き込みでPRGバンク(16KB窓、$8000-$BFFF)を
+# 切り替える。$C000-$FFFFは常に最終バンク固定。実機は「今そのアドレスに
+# 出ている値と同じ値を書く」ことでバスコンフリクトを避けるが、prg_write()
+# は既に/ROMSELを一旦解除してから書く設計(Mapper87/MMC3/CNROMと同じ)
+# なので、その制約は気にしなくてよい。
+#
+# CHRはROMではなくCHR-RAM(コンソール側で書き込み可能なメモリ)なので、
+# カートから読み出すデータは無い。.nesにはCHRサイズ0で書き出す。
+#
+# ドラゴンクエストII(Web調査)で確認した構成: PRG 128KB(16KB×8バンク)、
+# CHR-RAM 8KB、水平ミラーリング。
+def dump_unrom(d, path, mirror="h", prg_banks=8):
+    d.set_mode(MODE_PRG)
+    prg = bytearray()
+    for n in range(prg_banks):
+        d.prg_write(0x8000, n)
+        bank = d.prg_read(0x8000, 16 * 1024, verify=True)
+        prg += bank
+        print(f"  PRGバンク{n} 取得(書込値 {n})")
+
+    # $C000-$FFFFは常に最終バンク固定のはず。取得済みの最終バンクと
+    # 一致するか確かめる(生の$C000直読みだが、単発の照合なので許容)。
+    fixed = d.prg_read(0xC000, 16 * 1024)
+    if fixed != prg[-16 * 1024:]:
+        diffs = sum(1 for a, b in zip(fixed, prg[-16 * 1024:]) if a != b)
+        print(f"  ★ $C000固定窓が最終バンクと不一致({diffs}バイト)。参考情報として記録するが続行する")
+
+    bad = _sanity_bits(bytes(prg), "PRG")
+    if bad:
+        print("★ ビット分布が不自然。書き出さない:")
+        for b in bad:
+            print("   -", b)
+        raise DumperError("ビット分布の健全性チェックに失敗: " + ", ".join(bad))
+    print("  ビット分布チェック OK")
+
+    d.set_mode(MODE_IDLE)
+    write_ines(path, bytes(prg), b"", mapper=2, mirror=mirror)
+
+
+# ---------------------------------------------------------------- Sunsoft-1 (Mapper 184)
+#
+# PRGはバンク切り替えなしの32KB固定。CHRだけ4KB単位2枚窓で、レジスタは
+# $8000以降ではなく$6000-$7FFF(SRAM領域)にある。/ROMSELはA15依存
+# (`!(A15 & M2)`)なのでA15=0のこの範囲では自然に解除されており、
+# 他マッパーのようなバスコンフリクト対策は不要。
+#
+#   7  bit  0
+#   .1HH .LLL
+#    +++- $0000-0FFF窓の4KバンクL(0-7)
+#    +++- $1000-1FFF窓の4KバンクH(4-7のみ)
+#
+# アトランチスの謎(Web調査)で確認した構成: PRG 32KB(固定)、CHR 16KB
+# (4KB×4バンク、物理チップは4バンクしかないのでレジスタ上のL値0-3で
+# 全域を読める)、水平ミラーリング。
+def dump_sunsoft1(d, path, mirror="h", chr_banks=4):
+    d.set_mode(MODE_PRG)
+    prg = d.prg_read(0x8000, 32 * 1024, progress=True, verify=True)
+
+    vectors, problems = verify_prg(d, prg, 0x8000)
+    print("  ベクタ " + " ".join(f"{k}=${v:04X}" for k, v in vectors.items()))
+    if problems:
+        print("\n★ 検証に失敗した。書き出さない:")
+        for p in problems:
+            print("   -", p)
+        raise DumperError("PRGの検証に失敗")
+    print("  PRG検証 OK")
+
+    chr_data = bytearray()
+    for n in range(chr_banks):
+        d.set_mode(MODE_PRG)
+        d.prg_write(0x6000, 0x40 | (n & 0x07))
+        d.set_mode(MODE_CHR)
+        chr_data += d.chr_read(0x0000, 4 * 1024, verify=True)
+        print(f"  CHRバンク{n} 取得(書込値 {0x40 | (n & 0x07):#04x})")
+
+    bad = _sanity_bits(bytes(prg), "PRG") + _sanity_bits(bytes(chr_data), "CHR")
+    if bad:
+        print("★ ビット分布が不自然。書き出さない:")
+        for b in bad:
+            print("   -", b)
+        raise DumperError("ビット分布の健全性チェックに失敗: " + ", ".join(bad))
+    print("  ビット分布チェック OK")
+
+    d.set_mode(MODE_IDLE)
+    write_ines(path, prg, bytes(chr_data), mapper=184, mirror=mirror)
 
 
 # ---------------------------------------------------------------- MMC1 (Mapper 1)
@@ -390,39 +558,68 @@ MMC1_REG_CTRL, MMC1_REG_CHR0, MMC1_REG_CHR1, MMC1_REG_PRG = 0x8000, 0xA000, 0xC0
 
 
 def mmc1_write(d, addr, value):
-    d.prg_write(addr, 0x80)          # シフトレジスタをリセット
+    # fast=True: /ROMSEL↑とM2↓を1回のポート書き込みで同時に切る特別な
+    # 書き込みサイクル。MMC1+SRAM基板($E000/$F000)でこの2遷移が離れると
+    # 書き込みが化ける(sanniのcartreader実装のコメントより。2026-09-04、
+    # ドラゴンクエストIIIで発見)。
+    d.prg_write(addr, 0x80, fast=True)          # シフトレジスタをリセット
     time.sleep(0.002)
     for i in range(5):
-        d.prg_write(addr, (value >> i) & 1)
+        d.prg_write(addr, (value >> i) & 1, fast=True)
         time.sleep(0.002)
 
 
-def dump_mmc1(d, path, mirror="h", prg_banks=2, chr_banks=4):
+def dump_mmc1(d, path, mirror="h", prg_banks=2, chr_banks=4, prg_fixed=False, battery=False):
     d.set_mode(MODE_PRG)
-    ctrl = (0 << 4) | (2 << 2) | (2 if mirror == "h" else 3)
+    # PRGモード3=「$C000固定(最終バンク)・$8000で切替」(nesdev仕様で確認済み。
+    # 以前は2を使っていたが、2は逆の意味「$8000固定・$C000で切替」だった。
+    # このコードは$8000側を読んでいるので3が正しい)
+    ctrl = (0 << 4) | (3 << 2) | (2 if mirror == "h" else 3)
     mmc1_write(d, MMC1_REG_CTRL, ctrl)
 
-    prg = bytearray()
-    for n in range(prg_banks):
-        mmc1_write(d, MMC1_REG_PRG, n)
-        prg += d.prg_read(0x8000, 16 * 1024, verify=True)
-        _bar("PRG", len(prg), prg_banks * 16 * 1024)
-    print()
-
-    # 生の$C000直読みはしない(境界越えで化けることが分かっている、MMC3と同じ理由)。
-    # 同じ$8000窓を、同じPRGバンクレジスタ経由で読み直して突き合わせる。
-    v = prg[-6:]
-    vectors = {"NMI": v[1] << 8 | v[0], "RESET": v[3] << 8 | v[2], "IRQ": v[5] << 8 | v[4]}
     problems = []
-    for name, addr in vectors.items():
-        if not 0x8000 <= addr <= 0xFFFF:
-            problems.append(f"{name}ベクタ ${addr:04X} が $8000-$FFFF の外")
-    for bank in range(prg_banks):
-        mmc1_write(d, MMC1_REG_PRG, bank)
-        again = d.prg_read(0x8000, 64)
-        expect = prg[bank * 16384: bank * 16384 + 64]
-        if again != expect:
-            problems.append(f"バンク{bank}の再読が不一致($8000窓経由)")
+    if prg_fixed:
+        # SEROM基板(ドクターマリオ等): MMC1からのPRGバンク切替線が
+        # PRG ROMに配線されていない。PRGは32KB固定、NROM同然に直読みする
+        # (sanniのcartreaderのissue#1060で報告されている既知の構成、
+        # 2026-09-04確認)。CHRだけMMC1の通常のバンク切替が効く。
+        prg = d.prg_read(0x8000, 32 * 1024, verify=True)
+        v = prg[-6:]
+        vectors = {"NMI": v[1] << 8 | v[0], "RESET": v[3] << 8 | v[2], "IRQ": v[5] << 8 | v[4]}
+        for name, addr in vectors.items():
+            if not 0x8000 <= addr <= 0xFFFF:
+                problems.append(f"{name}ベクタ ${addr:04X} が $8000-$FFFF の外")
+    else:
+        # SUROM基板(512KB=32バンク、ドラゴンクエストIV等): PRGレジスタが
+        # 実質4bitしか配線されておらず、上位256KB/下位256KBの切替は
+        # CHR0レジスタのbit4(通称「512Kフラグ」)で行う(sanniのcartreader
+        # 実装で確認、2026-09-04)。CHR-RAM機でCHR0を一度も書かないと
+        # 上位256KBに届かない。
+        surom = prg_banks > 16
+        prg = bytearray()
+        for n in range(prg_banks):
+            if surom:
+                mmc1_write(d, MMC1_REG_CHR0, 0x10 if n > 15 else 0x00)
+            mmc1_write(d, MMC1_REG_PRG, n)
+            prg += d.prg_read(0x8000, 16 * 1024, verify=True)
+            _bar("PRG", len(prg), prg_banks * 16 * 1024)
+        print()
+
+        # 生の$C000直読みはしない(境界越えで化けることが分かっている、MMC3と同じ理由)。
+        # 同じ$8000窓を、同じPRGバンクレジスタ経由で読み直して突き合わせる。
+        v = prg[-6:]
+        vectors = {"NMI": v[1] << 8 | v[0], "RESET": v[3] << 8 | v[2], "IRQ": v[5] << 8 | v[4]}
+        for name, addr in vectors.items():
+            if not 0x8000 <= addr <= 0xFFFF:
+                problems.append(f"{name}ベクタ ${addr:04X} が $8000-$FFFF の外")
+        for bank in range(prg_banks):
+            if surom:
+                mmc1_write(d, MMC1_REG_CHR0, 0x10 if bank > 15 else 0x00)
+            mmc1_write(d, MMC1_REG_PRG, bank)
+            again = d.prg_read(0x8000, 64)
+            expect = prg[bank * 16384: bank * 16384 + 64]
+            if again != expect:
+                problems.append(f"バンク{bank}の再読が不一致($8000窓経由)")
     print("  ベクタ " + " ".join(f"{k}=${v:04X}" for k, v in vectors.items()))
     if problems:
         print("\n★ 検証に失敗した。書き出さない:")
@@ -434,7 +631,11 @@ def dump_mmc1(d, path, mirror="h", prg_banks=2, chr_banks=4):
     d.set_mode(MODE_CHR)
     chr_data = bytearray()
     for n in range(chr_banks):
-        mmc1_write(d, MMC1_REG_CHR0, n)
+        # 8KB CHRモード(bit4=0)ではCHR0レジスタの下位1bitが無視されるので、
+        # 8KB単位のバンクを選ぶには2ずつ進める(2026-09-04、ドクターマリオで
+        # グラフィックが乱れて発覚。n をそのまま書くとバンク0/1、2/3が
+        # それぞれ同じ内容になっていた)。
+        mmc1_write(d, MMC1_REG_CHR0, n * 2)
         chr_data += d.chr_read(0x0000, 8 * 1024, verify=True)
         _bar("CHR", len(chr_data), chr_banks * 8 * 1024)
     print()
@@ -448,7 +649,7 @@ def dump_mmc1(d, path, mirror="h", prg_banks=2, chr_banks=4):
     print("  ビット分布チェック OK")
 
     d.set_mode(MODE_IDLE)
-    write_ines(path, bytes(prg), bytes(chr_data), mapper=1, mirror=mirror)
+    write_ines(path, bytes(prg), bytes(chr_data), mapper=1, mirror=mirror, battery=battery)
 
 
 # ---------------------------------------------------------------- MMC3 (Mapper 4)
@@ -563,7 +764,10 @@ def verify_prg_mmc3(d, prg, prg_banks):
 
 def _sanity_bits(data, label, lo=0.15, hi=0.85):
     """ビットごとの1の割合が健全な範囲(既定15-85%)に収まっているか。
-    0%や100%に張り付くのは、その配線・その番地が化けている実測に基づく目安。"""
+    0%や100%に張り付くのは、その配線・その番地が化けている実測に基づく目安。
+    CHR-RAM機(データ長0)はチェック対象がないので素通り。"""
+    if not data:
+        return []
     bad = []
     for bit in range(8):
         ratio = sum((b >> bit) & 1 for b in data) / len(data)
@@ -667,13 +871,16 @@ def dump_mmc3(d, path, mirror="h", prg_banks=None, chr_banks=None):
     write_ines(path, bytes(prg), bytes(chr_data), mapper=4, mirror=mirror)
 
 
-def write_ines(path, prg, chr_data, mapper=0, mirror="h"):
+def write_ines(path, prg, chr_data, mapper=0, mirror="h", battery=False):
     """iNES(.nes)として書き出す。
 
     ミラーリングは自動判定できない。カート18番(VRAM A10)がカート側の出力で、
     今の配線では繋いでいないため。--mirror で指定すること。
+    battery: バッテリーバックアップSRAM搭載機(ドラクエ等)で立てる。
+    立てないとエミュレータがPRG-RAMを用意せず、起動時のセーブデータ
+    整合性チェックが失敗してフリーズすることがある(2026-09-04、DQ3で発見)。
     """
-    flags6 = ((mapper & 0x0F) << 4) | (0x01 if mirror == "v" else 0x00)
+    flags6 = ((mapper & 0x0F) << 4) | (0x01 if mirror == "v" else 0x00) | (0x02 if battery else 0x00)
     flags7 = mapper & 0xF0
     header = (b"NES\x1a"
               + bytes([len(prg) // 16384, len(chr_data) // 8192, flags6, flags7])
@@ -710,7 +917,7 @@ def main():
     w.add_argument("value")
 
     dp = sub.add_parser("dump")
-    dp.add_argument("mapper", choices=["nrom", "m87", "mmc1", "mmc3"])
+    dp.add_argument("mapper", choices=["nrom", "m87", "cnrom", "mmc1", "mmc3", "sunsoft1", "unrom"])
     dp.add_argument("out")
     dp.add_argument("--mirror", choices=["h", "v"], default="h")
     dp.add_argument("--chr", type=lambda s: int(s, 0), default=8192)
@@ -718,6 +925,11 @@ def main():
                      help="MMC3: 8KB単位のPRGバンク総数を手動指定(既定は自動判定)")
     dp.add_argument("--chr-banks", type=int, default=None,
                      help="MMC3: 1KB単位のCHRバンク総数を手動指定(既定は自動判定)")
+    dp.add_argument("--prg-fixed", action="store_true",
+                     help="MMC1: SEROM基板(ドクターマリオ等)向け。PRGバンク切替線が"
+                          "配線されていないので32KB固定で直読みする")
+    dp.add_argument("--battery", action="store_true",
+                     help="バッテリーバックアップSRAM搭載機(ドラクエ等)でヘッダに立てる")
 
     wk = sub.add_parser("walk")
     wk.add_argument("index", type=int)
@@ -751,11 +963,22 @@ def main():
         elif a.cmd == "dump":
             if a.mapper == "m87":
                 dump_m87(d, a.out, mirror=a.mirror)
+            elif a.mapper == "cnrom":
+                dump_cnrom(d, a.out, mirror=a.mirror,
+                           chr_banks=a.chr_banks if a.chr_banks else 2)
             elif a.mapper == "mmc1":
-                dump_mmc1(d, a.out, mirror=a.mirror)
+                dump_mmc1(d, a.out, mirror=a.mirror,
+                           prg_banks=a.prg_banks if a.prg_banks is not None else 2,
+                           chr_banks=a.chr_banks if a.chr_banks is not None else 4,
+                           prg_fixed=a.prg_fixed, battery=a.battery)
             elif a.mapper == "mmc3":
                 dump_mmc3(d, a.out, mirror=a.mirror,
                            prg_banks=a.prg_banks, chr_banks=a.chr_banks)
+            elif a.mapper == "sunsoft1":
+                dump_sunsoft1(d, a.out, mirror=a.mirror)
+            elif a.mapper == "unrom":
+                dump_unrom(d, a.out, mirror=a.mirror,
+                           prg_banks=a.prg_banks if a.prg_banks else 8)
             else:
                 dump_nrom(d, a.out, mirror=a.mirror, chr_size=a.chr)
         elif a.cmd == "walk":
